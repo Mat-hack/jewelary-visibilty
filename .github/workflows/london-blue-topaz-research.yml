@@ -1,0 +1,301 @@
+name: London Blue Topaz Research
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: london-blue-topaz-manual
+  cancel-in-progress: false
+
+jobs:
+  research:
+    name: Research current US listings
+    runs-on: ubuntu-latest
+    outputs:
+      research_status: ${{ steps.research.outputs.status }}
+    steps:
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Search and synthesize research
+        id: research
+        env:
+          TAVILY_API_KEY: ${{ secrets.TAVILY_API_KEY }}
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          RUN_ID: ${{ github.run_id }}-${{ github.run_attempt }}
+          TRIGGER: ${{ github.event_name }}
+          STARTED_AT: ${{ github.run_started_at }}
+        run: |
+          cat > research.py <<'PY'
+          import json, os, sys, time, urllib.request, urllib.error
+          from datetime import datetime, timezone
+
+          out = "handoff"
+          os.makedirs(out, exist_ok=True)
+          started = datetime.now(timezone.utc).isoformat()
+          record = {
+              "run_id": os.environ["RUN_ID"],
+              "trigger": os.environ.get("TRIGGER", "workflow_dispatch"),
+              "research_status": "failed",
+              "started_at_utc": started,
+              "finished_at_utc": None,
+              "output_path": "results/london-blue-topaz-rings.md",
+              "markdown": "",
+              "error": None
+          }
+
+          def request_json(url, payload, headers, attempts=3):
+              body = json.dumps(payload).encode()
+              for attempt in range(attempts):
+                  req = urllib.request.Request(url, data=body, headers={**headers, "Content-Type":"application/json"}, method="POST")
+                  try:
+                      with urllib.request.urlopen(req, timeout=45) as resp:
+                          return json.loads(resp.read().decode())
+                  except urllib.error.HTTPError as e:
+                      detail = e.read().decode(errors="replace")[:1200]
+                      if e.code not in (408, 429, 500, 502, 503, 504) or attempt == attempts - 1:
+                          raise RuntimeError(f"HTTP {e.code} from service: {detail}") from e
+                  except (urllib.error.URLError, TimeoutError) as e:
+                      if attempt == attempts - 1:
+                          raise RuntimeError(f"Transient network error after retries: {e}") from e
+                  time.sleep(2 ** attempt)
+              raise RuntimeError("Request failed after retries")
+
+          try:
+              if not os.environ.get("TAVILY_API_KEY"):
+                  raise RuntimeError("Missing repository secret TAVILY_API_KEY")
+              if not os.environ.get("OPENAI_API_KEY"):
+                  raise RuntimeError("Missing repository secret OPENAI_API_KEY")
+
+              search = request_json(
+                  "https://api.tavily.com/search",
+                  {
+                      "api_key": os.environ["TAVILY_API_KEY"],
+                      "query": "London blue topaz ring buy USA retailer product page price USD",
+                      "search_depth": "advanced",
+                      "topic": "general",
+                      "max_results": 10,
+                      "include_answer": False
+                  }, {}
+              )
+              results = search.get("results", [])
+              if not results:
+                  record["research_status"] = "no_reliable_products"
+                  record["markdown"] = (
+                      "# London Blue Topaz Rings — US Shopping Research\n\n"
+                      f"Research run: {record['run_id']}\n\n"
+                      "No reliable product listings were returned by the search provider. "
+                      "No retailers or prices have been invented. Please rerun the workflow later.\n"
+                  )
+              else:
+                  evidence = [{
+                      "title": r.get("title", ""),
+                      "url": r.get("url", ""),
+                      "content": (r.get("content", "") or "")[:2500],
+                      "score": r.get("score")
+                  } for r in results]
+                  prompt = """Create concise, useful shopping research for someone buying a London blue topaz ring in the United States. Use only the supplied search results. Include retailer/product links, prices in USD only when explicitly supported, metal/stone details when supported, and caveats about stock and price freshness. Do not claim a price or availability is verified if the evidence doesn't establish it. Prefer direct product pages over generic category pages. If no reliable product can be established, explicitly say so. Output Markdown only, with a brief methodology/date note and source links. Never invent listings or prices.\n\nSearch results JSON:\n""" + json.dumps(evidence, ensure_ascii=False)
+                  response = request_json(
+                      "https://api.openai.com/v1/chat/completions",
+                      {
+                          "model": "gpt-4o-mini",
+                          "temperature": 0.2,
+                          "messages": [
+                              {"role":"system","content":"You are a careful shopping research assistant. Ground every claim in provided search evidence; never invent products, prices, or availability."},
+                              {"role":"user","content":prompt}
+                          ]
+                      },
+                      {"Authorization": "Bearer " + os.environ["OPENAI_API_KEY"]}
+                  )
+                  markdown = response["choices"][0]["message"]["content"].strip()
+                  if not markdown:
+                      raise RuntimeError("Synthesis service returned empty content")
+                  record["markdown"] = markdown + "\n"
+                  record["research_status"] = "succeeded" if any(r.get("url") for r in results) else "no_reliable_products"
+          except Exception as e:
+              record["error"] = str(e)
+              record["markdown"] = (
+                  "# London Blue Topaz Rings — US Shopping Research\n\n"
+                  f"Research run: {record['run_id']}\n\n"
+                  "Research failed before reliable recommendations could be produced. "
+                  "No product or price claims are being made.\n\n"
+                  f"Failure: {str(e)}\n"
+              )
+          finally:
+              record["finished_at_utc"] = datetime.now(timezone.utc).isoformat()
+              with open(os.path.join(out, "research.json"), "w", encoding="utf-8") as f:
+                  json.dump(record, f, indent=2, ensure_ascii=False)
+              with open(os.path.join(out, "london-blue-topaz-rings.md"), "w", encoding="utf-8") as f:
+                  f.write(record["markdown"])
+              with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as f:
+                  f.write("status=" + record["research_status"] + "\n")
+
+          if record["research_status"] == "failed":
+              sys.exit(1)
+          PY
+          python research.py
+
+      - name: Upload research handoff
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: london-blue-topaz-research
+          path: handoff/
+          if-no-files-found: error
+          retention-days: 14
+
+  persist:
+    name: Persist results and run record
+    needs: research
+    if: ${{ always() && needs.research.result != 'cancelled' }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      actions: read
+    steps:
+      - name: Check out main
+        uses: actions/checkout@v4
+        with:
+          ref: main
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Download actual research artifact
+        id: download
+        uses: actions/download-artifact@v4
+        with:
+          name: london-blue-topaz-research
+          path: handoff
+        continue-on-error: true
+
+      - name: Validate handoff and prepare files
+        id: prepare
+        env:
+          RUN_ID: ${{ github.run_id }}-${{ github.run_attempt }}
+          TRIGGER: ${{ github.event_name }}
+          RESEARCH_JOB_RESULT: ${{ needs.research.result }}
+          DOWNLOAD_OUTCOME: ${{ steps.download.outcome }}
+        run: |
+          python - <<'PY'
+          import json, os, sys
+          from datetime import datetime, timezone
+          os.makedirs("results", exist_ok=True)
+          os.makedirs("scheduler/runs", exist_ok=True)
+          now = datetime.now(timezone.utc).isoformat()
+          run_id = os.environ["RUN_ID"]
+          research_file = "handoff/research.json"
+          markdown_file = "handoff/london-blue-topaz-rings.md"
+          artifact_ok = os.path.isfile(research_file) and os.path.isfile(markdown_file)
+          research = {}
+          if artifact_ok:
+              try:
+                  with open(research_file, encoding="utf-8") as f:
+                      research = json.load(f)
+                  artifact_ok = isinstance(research, dict) and isinstance(research.get("markdown"), str)
+              except Exception:
+                  artifact_ok = False
+
+          if not artifact_ok:
+              print("Research artifact is missing or invalid; refusing to fabricate results.", file=sys.stderr)
+              sys.exit(1)
+
+          output = "results/london-blue-topaz-rings.md"
+          with open(markdown_file, encoding="utf-8") as f:
+              markdown = f.read()
+          with open(output, "w", encoding="utf-8") as f:
+              f.write(markdown)
+
+          research_status = research.get("research_status", "failed")
+          overall = "succeeded" if os.environ["RESEARCH_JOB_RESULT"] == "success" and research_status in ("succeeded", "no_reliable_products") else "failed"
+          record = {
+              "run_id": run_id,
+              "trigger": os.environ.get("TRIGGER", "workflow_dispatch"),
+              "overall_status": overall,
+              "task_statuses": {
+                  "research": research_status,
+                  "persist": "in_progress"
+              },
+              "timestamps_utc": {
+                  "research_started_at": research.get("started_at_utc"),
+                  "research_finished_at": research.get("finished_at_utc"),
+                  "persist_prepared_at": now
+              },
+              "output_path": output,
+              "research_artifact_path": "handoff/research.json",
+              "artifact_commit_sha": None,
+              "error": research.get("error")
+          }
+          run_path = "scheduler/runs/" + run_id.replace("/", "-") + ".json"
+          with open(run_path, "w", encoding="utf-8") as f:
+              json.dump(record, f, indent=2, ensure_ascii=False)
+              f.write("\n")
+          with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as f:
+              f.write("run_path=" + run_path + "\n")
+              f.write("overall_status=" + overall + "\n")
+          PY
+
+      - name: Commit files if changed (with retry)
+        id: commit
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RUN_PATH: ${{ steps.prepare.outputs.run_path }}
+          RESEARCH_JOB_RESULT: ${{ needs.research.result }}
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add results/london-blue-topaz-rings.md "$RUN_PATH"
+          if git diff --cached --quiet; then
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+            echo "No file changes; skipping commit."
+            exit 0
+          fi
+          git commit -m "Record London blue topaz research run ${{ github.run_id }}"
+          FIRST_COMMIT_SHA="$(git rev-parse HEAD)"
+          python - "$RUN_PATH" "$FIRST_COMMIT_SHA" "$RESEARCH_JOB_RESULT" <<'PY'
+          import json, sys
+          path, sha, research_job_result = sys.argv[1:]
+          with open(path, encoding="utf-8") as f:
+              record = json.load(f)
+          record["artifact_commit_sha"] = sha
+          record["task_statuses"]["persist"] = "succeeded"
+          record["timestamps_utc"]["persist_committed_at"] = __import__("datetime").datetime.now(__import__("datetime").timezone.utc).isoformat()
+          with open(path, "w", encoding="utf-8") as f:
+              json.dump(record, f, indent=2, ensure_ascii=False)
+              f.write("\n")
+          PY
+          git add "$RUN_PATH"
+          git commit -m "Attach artifact commit SHA to run record"
+          for attempt in 1 2 3; do
+            if git push origin HEAD:main; then
+              echo "changed=true" >> "$GITHUB_OUTPUT"
+              echo "final_commit_sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+            if [ "$attempt" -lt 3 ]; then
+              sleep $((attempt * 3))
+              git fetch origin main
+              git rebase origin/main || { git rebase --abort || true; }
+            fi
+          done
+          echo "Git push failed after retries. Artifact remains available in the Actions run." >&2
+          exit 1
+
+      - name: Report status in job summary
+        if: always()
+        env:
+          RESEARCH_RESULT: ${{ needs.research.result }}
+          PERSIST_RESULT: ${{ job.status }}
+          FINAL_SHA: ${{ steps.commit.outputs.final_commit_sha }}
+          CHANGED: ${{ steps.commit.outputs.changed }}
+        run: |
+          {
+            echo "## London Blue Topaz Research"
+            echo "- Research job: $RESEARCH_RESULT"
+            echo "- Persistence job: $PERSIST_RESULT"
+            echo "- Files changed and committed: ${CHANGED:-unknown}"
+            if [ -n "$FINAL_SHA" ]; then echo "- Final commit: $FINAL_SHA"; fi
+          } >> "$GITHUB_STEP_SUMMARY"
